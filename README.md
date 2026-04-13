@@ -17,8 +17,8 @@ A fast, interactive disk space analyzer for the terminal. Built in Rust with [ra
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/treesize-homemade.git
-cd treesize-homemade
+git clone https://github.com/nekr0w/treesize.git
+cd treesize
 cargo build --release
 # Binary at ./target/release/treesize
 ```
