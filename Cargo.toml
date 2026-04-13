@@ -1,0 +1,15 @@
+[package]
+name = "treesize"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+tui-tree-widget = "0.24"
+jwalk = "0.8"
+color-eyre = "0.6"
+
+[profile.release]
+lto = true
+strip = true
