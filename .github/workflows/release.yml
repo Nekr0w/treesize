@@ -12,9 +12,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: treesize-macos-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-13
-            artifact: treesize-macos-x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: treesize-linux-x86_64
@@ -46,5 +43,4 @@ jobs:
             --title "$tag" \
             --generate-notes \
             treesize-macos-aarch64/treesize-macos-aarch64 \
-            treesize-macos-x86_64/treesize-macos-x86_64 \
             treesize-linux-x86_64/treesize-linux-x86_64
