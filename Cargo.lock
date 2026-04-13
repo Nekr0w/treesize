@@ -1607,6 +1607,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "jwalk",
+ "libc",
  "ratatui",
  "tui-tree-widget",
 ]

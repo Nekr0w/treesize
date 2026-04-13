@@ -9,6 +9,7 @@ crossterm = "0.29"
 tui-tree-widget = "0.24"
 jwalk = "0.8"
 color-eyre = "0.6"
+libc = "0.2"
 
 [profile.release]
 lto = true

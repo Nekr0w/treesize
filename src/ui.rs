@@ -181,19 +181,69 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let status = app.status_message.as_deref().unwrap_or("");
+    let disk_info = disk_usage_string(&app.target_path);
 
     let content = format!(
         " TreeSize — {}  [{total_size}]{scan_indicator}  {status}",
         app.target_path.display(),
     );
 
-    let header = Paragraph::new(content).style(
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    let content_len = content.len();
+    let header_line = Line::from(vec![
+        Span::styled(
+            content,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // Right-align disk usage: pad to fill remaining width
+        Span::styled(
+            format!(
+                "{:>width$}",
+                disk_info,
+                width = (area.width as usize).saturating_sub(content_len)
+            ),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]);
+
+    let header = Paragraph::new(header_line).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(header, area);
+}
+
+/// Get disk usage string for the filesystem containing `path`.
+fn disk_usage_string(path: &std::path::Path) -> String {
+    let Some((used, total)) = get_disk_usage(path) else {
+        return String::new();
+    };
+    let pct = if total > 0 {
+        used as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "Disk: {}/{} ({pct:.1}%)",
+        format_size(used),
+        format_size(total),
+    )
+}
+
+/// Query filesystem stats via libc::statvfs.
+fn get_disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_str()?).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            let block_size = stat.f_frsize as u64;
+            let total = stat.f_blocks as u64 * block_size;
+            let available = stat.f_bavail as u64 * block_size;
+            let used = total - available;
+            Some((used, total))
+        } else {
+            None
+        }
+    }
 }
 
 // ── Tree view ─────────────────────────────────────────────────────
