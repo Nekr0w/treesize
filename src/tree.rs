@@ -1,14 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const SIZE_UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScanState {
-    /// Children not yet listed.
-    NotScanned,
-    /// Children have been listed (sizes may still be computing).
-    Scanned,
-}
 
 /// A node in the file tree, representing either a file or a directory.
 #[derive(Debug, Clone)]
@@ -18,8 +11,9 @@ pub struct FileNode {
     pub size: u64,
     pub is_dir: bool,
     pub children: Vec<FileNode>,
-    pub error: Option<String>,
-    pub scan_state: ScanState,
+    /// Whether children have been listed (sizes may still be computing).
+    /// Files are scanned from birth; directories only once expanded.
+    pub scanned: bool,
 }
 
 impl FileNode {
@@ -28,19 +22,13 @@ impl FileNode {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let scan_state = if is_dir {
-            ScanState::NotScanned
-        } else {
-            ScanState::Scanned
-        };
         Self {
             path,
             name,
             size,
             is_dir,
             children: Vec::new(),
-            error: None,
-            scan_state,
+            scanned: !is_dir,
         }
     }
 
@@ -104,25 +92,6 @@ impl FileNode {
         None
     }
 
-    /// Update a descendant's size and propagate the change up to the root.
-    /// Re-sorts children at each affected level.
-    pub fn update_descendant_size(&mut self, target: &Path, new_size: u64) -> bool {
-        if self.path == target {
-            self.size = new_size;
-            return true;
-        }
-        for child in &mut self.children {
-            if target.starts_with(&child.path) {
-                if child.update_descendant_size(target, new_size) {
-                    self.size = self.children.iter().map(|c| c.size).sum();
-                    self.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Recompute this node's size as the sum of its children (recursive).
     #[cfg(test)]
     pub fn recompute_size(&mut self) {
@@ -131,6 +100,23 @@ impl FileNode {
                 child.recompute_size();
             }
             self.size = self.children.iter().map(|c| c.size).sum();
+        }
+    }
+
+    /// Apply precomputed directory totals from the size cache to every loaded
+    /// node, then re-sort each level. Dirs prefer the cached total; if absent
+    /// (e.g. cache not ready yet) they fall back to the sum of their children.
+    pub fn apply_sizes(&mut self, cache: &HashMap<PathBuf, u64>) {
+        for child in &mut self.children {
+            child.apply_sizes(cache);
+        }
+        if self.is_dir {
+            if let Some(&size) = cache.get(&self.path) {
+                self.size = size;
+            } else if !self.children.is_empty() {
+                self.size = self.children.iter().map(|c| c.size).sum();
+            }
+            self.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
         }
     }
 
@@ -210,21 +196,28 @@ mod tests {
     }
 
     #[test]
-    fn test_update_descendant_size() {
+    fn test_apply_sizes_uses_cache_not_just_children() {
+        // Regression: expanding a dir must NOT collapse its known total to the
+        // sum of its (still-zero) immediate sub-dirs. The cache holds the truth.
         let mut root = FileNode::new(PathBuf::from("/root"), 0, true);
-        let mut dir = FileNode::new(PathBuf::from("/root/dir"), 0, true);
-        dir.children = vec![
-            FileNode::new(PathBuf::from("/root/dir/file"), 50, false),
+        let mut lib = FileNode::new(PathBuf::from("/root/lib"), 0, true);
+        // lib was just expanded: a 0-size sub-dir + one small loose file.
+        lib.children = vec![
+            FileNode::new(PathBuf::from("/root/lib/sub"), 0, true),
+            FileNode::new(PathBuf::from("/root/lib/f"), 10, false),
         ];
-        dir.recompute_size();
-        root.children = vec![dir];
-        root.recompute_size();
-        assert_eq!(root.size, 50);
+        root.children = vec![lib];
 
-        // Simulate a size computation result for /root/dir
-        root.update_descendant_size(Path::new("/root/dir"), 500);
-        assert_eq!(root.children[0].size, 500);
-        assert_eq!(root.size, 500); // Propagated up
+        let mut cache = HashMap::new();
+        cache.insert(PathBuf::from("/root/lib"), 99_000);
+        cache.insert(PathBuf::from("/root/lib/sub"), 98_990);
+
+        root.apply_sizes(&cache);
+
+        let lib = &root.children[0];
+        assert_eq!(lib.size, 99_000); // from cache, not 10 (sum of children)
+        assert_eq!(lib.children[0].size, 98_990); // sub got its cached total
+        assert_eq!(root.size, 99_000); // propagated to root
     }
 
     #[test]

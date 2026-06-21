@@ -1,14 +1,14 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tui_tree_widget::TreeState;
 
-use crate::scanner::{self, ScanManager, ScanPriority, ScanResult};
-use crate::tree::{FileNode, ScanState};
+use crate::scanner::{self, ScanManager, ScanStatus};
+use crate::store;
+use crate::tree::FileNode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppMode {
-    Scanning,
     Browsing,
     ConfirmDelete,
 }
@@ -27,13 +27,13 @@ pub enum Message {
 
     // Actions
     Rescan,
+    SaveScan,
     RequestDelete,
     ConfirmDelete,
     CancelDelete,
 
     // Lifecycle
     Quit,
-    ForceQuit,
     None,
 }
 
@@ -45,18 +45,25 @@ pub struct App {
     pub target_path: PathBuf,
     pub delete_target: Option<(PathBuf, u64, bool)>,
     pub scanner: ScanManager,
+    /// Total size of every directory seen so far, built by the background walk.
+    /// Lets expand be an instant lookup instead of a re-scan.
+    pub size_cache: HashMap<PathBuf, u64>,
+    /// Which directories are queued / actively scanning (for per-item markers).
+    pub scan_status: ScanStatus,
 }
 
 impl App {
     pub fn new(target_path: PathBuf) -> Self {
         Self {
-            mode: AppMode::Scanning,
+            mode: AppMode::Browsing,
             root: None,
             tree_state: TreeState::default(),
             status_message: None,
             target_path,
             delete_target: None,
             scanner: ScanManager::new(),
+            size_cache: HashMap::new(),
+            scan_status: ScanStatus::default(),
         }
     }
 
@@ -68,33 +75,79 @@ impl App {
         // Synchronous read_dir → first level appears instantly
         let children = scanner::list_children(&self.target_path);
         root.children = children;
-        root.scan_state = ScanState::Scanned;
+        root.scanned = true;
         root.size = root.children.iter().map(|c| c.size).sum();
         root.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
-        self.root = Some(root);
-        self.mode = AppMode::Browsing;
+        // Submit each top-level directory as its own job so they scan in
+        // parallel across workers (instead of one serial walk of the root).
+        let dir_paths: Vec<PathBuf> = root
+            .children
+            .iter()
+            .filter(|c| c.is_dir)
+            .map(|c| c.path.clone())
+            .collect();
 
-        // Background: compute sizes via single jwalk walk
-        self.scanner
-            .submit(self.target_path.clone(), ScanPriority::High);
+        self.root = Some(root);
+
+        for path in dir_paths {
+            self.scanner.submit(path);
+        }
+    }
+
+    /// Open a previously saved scan: structure from disk, sizes from the saved
+    /// cache. No background scan — everything is known instantly.
+    pub fn load_scan(&mut self, cache: HashMap<PathBuf, u64>) {
+        self.size_cache = cache;
+
+        let mut root = FileNode::new(self.target_path.clone(), 0, true);
+        root.children = scanner::list_children(&self.target_path);
+        root.scanned = true;
+        self.root = Some(root);
+
+        if let Some(root) = &mut self.root {
+            root.apply_sizes(&self.size_cache);
+        }
+    }
+
+    /// Save the current size cache so it can be reopened with `--load`.
+    fn save_scan(&mut self) {
+        let name = self
+            .target_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "root".to_string());
+        let file = std::env::current_dir()
+            .unwrap_or_default()
+            .join(format!("{name}.treesize"));
+
+        let partial = if self.scanner.pending_count() > 0 {
+            " (partial — scan still running)"
+        } else {
+            ""
+        };
+
+        self.status_message = Some(match store::save(&file, &self.target_path, &self.size_cache) {
+            Ok(()) => format!("Saved to {}{partial}", file.display()),
+            Err(e) => format!("Save failed: {e}"),
+        });
     }
 
     /// Poll the scanner for results (non-blocking). Called every tick.
     pub fn poll_scan(&mut self) {
+        let mut got_sizes = false;
         while let Ok(result) = self.scanner.result_rx.try_recv() {
-            match result {
-                ScanResult::ChildrenListed { parent, children } => {
-                    self.handle_children_listed(&parent, children);
-                }
-                ScanResult::ChildSizeComputed { child, size } => {
-                    self.handle_size_computed(&child, size);
-                }
-                ScanResult::ScanComplete { parent } => {
-                    self.handle_scan_complete(&parent);
-                }
+            self.size_cache.extend(result.sizes);
+            got_sizes = true;
+        }
+        if got_sizes {
+            if let Some(root) = &mut self.root {
+                root.apply_sizes(&self.size_cache);
             }
         }
+        // Refresh queued/active markers every tick (jobs start & finish on
+        // worker threads, independent of whether sizes arrived this tick).
+        self.scan_status = self.scanner.status();
     }
 
     /// Process a message and mutate state. Returns true if the app should quit.
@@ -117,6 +170,7 @@ impl App {
 
             // Actions
             Message::Rescan => self.rescan_selected(),
+            Message::SaveScan => self.save_scan(),
             Message::RequestDelete => self.request_delete(),
             Message::ConfirmDelete => self.confirm_delete(),
             Message::CancelDelete => {
@@ -124,61 +178,9 @@ impl App {
                 self.delete_target = None;
             }
 
-            Message::Quit | Message::ForceQuit => return true,
+            Message::Quit => return true,
         }
         false
-    }
-
-    // ── Scan result handlers ──────────────────────────────────────
-
-    fn handle_children_listed(&mut self, parent_path: &Path, new_children: Vec<FileNode>) {
-        if let Some(root) = &mut self.root {
-            if let Some(parent) = root.find_mut(parent_path) {
-                // Merge: preserve existing sub-trees and computed sizes
-                let mut existing: HashMap<PathBuf, FileNode> = parent
-                    .children
-                    .drain(..)
-                    .map(|c| (c.path.clone(), c))
-                    .collect();
-
-                parent.children = new_children
-                    .into_iter()
-                    .map(|mut new_child| {
-                        if let Some(old) = existing.remove(&new_child.path) {
-                            if new_child.is_dir {
-                                // Preserve sub-tree, scan state, and computed size
-                                if !old.children.is_empty() {
-                                    new_child.children = old.children;
-                                    new_child.scan_state = old.scan_state;
-                                }
-                                if old.size > 0 {
-                                    new_child.size = old.size;
-                                }
-                            }
-                        }
-                        new_child
-                    })
-                    .collect();
-
-                parent.scan_state = ScanState::Scanned;
-                parent.size = parent.children.iter().map(|c| c.size).sum();
-                parent.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-            }
-        }
-    }
-
-    fn handle_size_computed(&mut self, child_path: &Path, size: u64) {
-        if let Some(root) = &mut self.root {
-            root.update_descendant_size(child_path, size);
-        }
-    }
-
-    fn handle_scan_complete(&mut self, parent_path: &Path) {
-        if let Some(root) = &mut self.root {
-            if let Some(parent) = root.find_mut(parent_path) {
-                parent.scan_state = ScanState::Scanned;
-            }
-        }
     }
 
     // ── Expand with synchronous read_dir ──────────────────────────
@@ -197,23 +199,33 @@ impl App {
             .root
             .as_ref()
             .and_then(|r| r.find(&path))
-            .is_some_and(|n| n.is_dir && matches!(n.scan_state, ScanState::NotScanned));
+            .is_some_and(|n| n.is_dir && !n.scanned);
 
         if needs_scan {
-            // Synchronous read_dir → children appear instantly
-            let children = scanner::list_children(&path);
+            // Structure is a synchronous read_dir (instant). Sizes come from the
+            // single background walk's cache — whatever it has computed so far,
+            // filling in live from the leaves up. No per-expand re-scan.
+            let mut children = scanner::list_children(&path);
+            for c in &mut children {
+                if c.is_dir {
+                    if let Some(&size) = self.size_cache.get(&c.path) {
+                        c.size = size;
+                    }
+                }
+            }
 
             if let Some(root) = &mut self.root {
                 if let Some(node) = root.find_mut(&path) {
                     node.children = children;
-                    node.scan_state = ScanState::Scanned;
-                    node.size = node.children.iter().map(|c| c.size).sum();
+                    node.scanned = true;
+                    // Keep the node's own (already-computed) total — never
+                    // collapse it to the sum of not-yet-scanned children.
+                    if let Some(&total) = self.size_cache.get(&path) {
+                        node.size = total;
+                    }
                     node.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
                 }
             }
-
-            // Background: compute children sizes
-            self.scanner.submit(path, ScanPriority::High);
         }
     }
 
@@ -244,14 +256,14 @@ impl App {
         if let Some(root) = &mut self.root {
             if let Some(node) = root.find_mut(&path) {
                 node.children = children;
-                node.scan_state = ScanState::Scanned;
+                node.scanned = true;
                 node.size = node.children.iter().map(|c| c.size).sum();
                 node.children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
             }
         }
 
         // Background: recompute sizes
-        self.scanner.submit(path, ScanPriority::High);
+        self.scanner.submit(path);
         self.status_message = Some("Rescanning...".to_string());
     }
 
@@ -279,7 +291,7 @@ impl App {
     }
 
     fn confirm_delete(&mut self) {
-        let Some((path, _size, is_dir)) = self.delete_target.take() else {
+        let Some((path, size, is_dir)) = self.delete_target.take() else {
             self.mode = AppMode::Browsing;
             return;
         };
@@ -295,6 +307,19 @@ impl App {
                 if let Some(root) = &mut self.root {
                     root.remove_descendant(&path);
                 }
+                // Keep cached ancestor totals accurate so re-expanding a parent
+                // doesn't resurrect the deleted size from the cache.
+                let mut ancestor = path.parent();
+                while let Some(dir) = ancestor {
+                    if let Some(v) = self.size_cache.get_mut(dir) {
+                        *v = v.saturating_sub(size);
+                    }
+                    if dir == self.target_path {
+                        break;
+                    }
+                    ancestor = dir.parent();
+                }
+                self.size_cache.remove(&path);
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.status_message = Some(format!("Deleted: {name}"));
             }

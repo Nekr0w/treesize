@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -6,7 +8,42 @@ use ratatui::Frame;
 use tui_tree_widget::{Tree, TreeItem};
 
 use crate::app::{App, AppMode};
-use crate::tree::{format_size, FileNode, ScanState};
+use crate::scanner::ScanStatus;
+use crate::tree::{format_size, FileNode};
+
+// ── Per-item scan marker ──────────────────────────────────────────
+
+/// What the renderer needs to mark each node's scan state.
+struct ScanCtx<'a> {
+    target: &'a Path,
+    status: &'a ScanStatus,
+}
+
+/// The submitted job that owns `path`: the top-level directory under `target`
+/// that contains it (or `path` itself if it is one). Deeper nodes inherit the
+/// status of the single walk that computes their subtree.
+fn top_level_owner(path: &Path, target: &Path) -> PathBuf {
+    path.strip_prefix(target)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .map(|first| target.join(first))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// A 2-cell marker: spinner = scanning, ◦ = queued, ✓ = done, blank for files.
+fn scan_marker(node: &FileNode, ctx: &ScanCtx) -> Span<'static> {
+    if !node.is_dir {
+        return Span::raw("  ");
+    }
+    let owner = top_level_owner(&node.path, ctx.target);
+    if ctx.status.active.contains(&owner) {
+        Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan))
+    } else if ctx.status.queued.contains(&owner) {
+        Span::styled("◦ ", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled("✓ ", Style::default().fg(Color::Green))
+    }
+}
 
 // ── Color thresholds (single source of truth) ─────────────────────
 
@@ -51,7 +88,7 @@ fn render_size_bar(percentage: f64) -> String {
 
 // ── Display line (single composition function) ────────────────────
 
-fn build_display_line(node: &FileNode, parent_size: u64) -> Line<'static> {
+fn build_display_line(node: &FileNode, parent_size: u64, ctx: &ScanCtx) -> Line<'static> {
     let type_indicator = if node.is_dir { "[D] " } else { "[F] " };
     let name = if node.is_dir {
         format!("{}/", node.name)
@@ -64,13 +101,8 @@ fn build_display_line(node: &FileNode, parent_size: u64) -> Line<'static> {
     let bar = render_size_bar(percentage);
     let color = size_color(node.size);
 
-    let error_suffix = node
-        .error
-        .as_ref()
-        .map(|e| format!(" ⚠ {e}"))
-        .unwrap_or_default();
-
     Line::from(vec![
+        scan_marker(node, ctx),
         Span::styled(type_indicator, Style::default().fg(Color::DarkGray)),
         Span::styled(
             name,
@@ -90,20 +122,17 @@ fn build_display_line(node: &FileNode, parent_size: u64) -> Line<'static> {
             format!("  {percentage:5.1}%"),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(error_suffix, Style::default().fg(Color::Red)),
     ])
 }
 
 // ── FileNode → TreeItem conversion (single recursive function) ────
 
-fn node_to_tree_item(node: &FileNode, parent_size: u64) -> TreeItem<'static, String> {
+fn node_to_tree_item(node: &FileNode, parent_size: u64, ctx: &ScanCtx) -> TreeItem<'static, String> {
     let id = node.path.to_string_lossy().into_owned();
-    let line = build_display_line(node, parent_size);
-
-    let is_scanned = matches!(node.scan_state, ScanState::Scanned);
+    let line = build_display_line(node, parent_size, ctx);
 
     // Leaf: file, or genuinely empty scanned directory
-    if node.children.is_empty() && (!node.is_dir || is_scanned) {
+    if node.children.is_empty() && (!node.is_dir || node.scanned) {
         return TreeItem::new_leaf(id, line);
     }
 
@@ -118,7 +147,7 @@ fn node_to_tree_item(node: &FileNode, parent_size: u64) -> TreeItem<'static, Str
     let children: Vec<TreeItem<'static, String>> = node
         .children
         .iter()
-        .map(|c| node_to_tree_item(c, node.size))
+        .map(|c| node_to_tree_item(c, node.size, ctx))
         .collect();
     TreeItem::new(id, line, children).expect("TreeItem children should be valid")
 }
@@ -160,6 +189,16 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
 const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Current frame of the shared spinner animation (advances ~12x/sec).
+fn spinner_char() -> char {
+    let tick = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 80) as usize;
+    SPINNER_CHARS[tick % SPINNER_CHARS.len()]
+}
+
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let total_size = app
         .root
@@ -169,13 +208,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 
     let pending = app.scanner.pending_count();
     let scan_indicator = if pending > 0 {
-        let tick = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            / 80) as usize;
-        let spinner = SPINNER_CHARS[tick % SPINNER_CHARS.len()];
-        format!("  {spinner} scanning ({pending})")
+        format!("  {} scanning ({pending})", spinner_char())
     } else {
         String::new()
     };
@@ -257,19 +290,24 @@ fn render_tree(app: &mut App, frame: &mut Frame, area: Rect) {
     };
 
     if root.children.is_empty() {
-        let msg = match root.scan_state {
-            ScanState::Scanned => "  (empty directory)",
-            _ => "  Scanning...",
+        let msg = if root.scanned {
+            "  (empty directory)"
+        } else {
+            "  Scanning..."
         };
         let loading = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(loading, area);
         return;
     }
 
+    let ctx = ScanCtx {
+        target: &app.target_path,
+        status: &app.scan_status,
+    };
     let items: Vec<TreeItem<'static, String>> = root
         .children
         .iter()
-        .map(|c| node_to_tree_item(c, root.size))
+        .map(|c| node_to_tree_item(c, root.size, &ctx))
         .collect();
 
     let tree = Tree::new(&items)
@@ -289,9 +327,8 @@ fn render_tree(app: &mut App, frame: &mut Frame, area: Rect) {
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let hints = match app.mode {
-        AppMode::Scanning => " q/Ctrl+C: Quit",
         AppMode::Browsing => {
-            " ↑↓/jk: Navigate  Enter/l: Expand  Bksp/h: Collapse  r: Rescan  d: Delete  q: Quit"
+            " ↑↓/jk: Navigate  Enter/l: Expand  Bksp/h: Collapse  r: Rescan  s: Save  d: Delete  q: Quit"
         }
         AppMode::ConfirmDelete => " y: Confirm  n/Esc: Cancel",
     };

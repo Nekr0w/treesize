@@ -6,23 +6,12 @@ use crate::app::{AppMode, Message};
 pub fn handle_key(key: KeyEvent, mode: &AppMode) -> Message {
     // Ctrl+C always quits
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return match mode {
-            AppMode::Scanning => Message::ForceQuit,
-            _ => Message::Quit,
-        };
+        return Message::Quit;
     }
 
     match mode {
-        AppMode::Scanning => handle_scanning_key(key),
         AppMode::Browsing => handle_browsing_key(key),
         AppMode::ConfirmDelete => handle_confirm_delete_key(key),
-    }
-}
-
-fn handle_scanning_key(key: KeyEvent) -> Message {
-    match key.code {
-        KeyCode::Char('q') => Message::ForceQuit,
-        _ => Message::None,
     }
 }
 
@@ -36,11 +25,11 @@ fn handle_browsing_key(key: KeyEvent) -> Message {
         KeyCode::PageUp => Message::PageUp,
         KeyCode::PageDown => Message::PageDown,
         KeyCode::Home | KeyCode::Char('g') => Message::GoToFirst,
-        KeyCode::End => Message::GoToLast,
-        KeyCode::Char('G') => Message::GoToLast,
+        KeyCode::End | KeyCode::Char('G') => Message::GoToLast,
 
         // Actions
         KeyCode::Char('r') => Message::Rescan,
+        KeyCode::Char('s') => Message::SaveScan,
         KeyCode::Char('d') | KeyCode::Delete => Message::RequestDelete,
         KeyCode::Char('q') => Message::Quit,
 
